@@ -44,15 +44,29 @@ type ParsedLocation = {
   heading: number;
   altitude: number;
   recordedAt: string;
+  batteryVoltageMv?: number;
+  batteryVoltage?: number;
+  batteryPercent?: number;
+  signalStrength?: number;
+  satelliteCount?: number;
 };
 
 type AdditionalInfoField = {
   fieldId: number;
   length: number;
-  hex: string;
+  value: Buffer;
 };
 
 const LOCATION_0200_BASE_BODY_LENGTH = 28;
+const TK905B_EB_FIELD_ID = 0xeb;
+const TK905B_EB_BATTERY_VOLTAGE_OFFSET = 34;
+const TK905B_EB_BATTERY_PERCENT_OFFSET = 40;
+const TK905B_EB_MIN_LENGTH_FOR_BATTERY = 36;
+const TK905B_EB_MIN_LENGTH_FOR_BATTERY_PERCENT = 41;
+const BATTERY_VOLTAGE_MV_MIN = 3000;
+const BATTERY_VOLTAGE_MV_MAX = 4500;
+const BATTERY_PERCENT_MIN = 0;
+const BATTERY_PERCENT_MAX = 100;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -222,12 +236,51 @@ function parse0200AdditionalInfo(
     fields.push({
       fieldId,
       length,
-      hex: value.toString("hex"),
+      value,
     });
     offset += 2 + length;
   }
 
   return { rawHex: extras.toString("hex"), fields };
+}
+
+function parse0200HealthExtras(fields: AdditionalInfoField[]): Pick<
+  ParsedLocation,
+  "batteryVoltageMv" | "batteryVoltage" | "batteryPercent" | "signalStrength" | "satelliteCount"
+> {
+  const extras: Pick<
+    ParsedLocation,
+    "batteryVoltageMv" | "batteryVoltage" | "batteryPercent" | "signalStrength" | "satelliteCount"
+  > = {};
+
+  for (const field of fields) {
+    if (field.fieldId === 0x30 && field.length >= 1) {
+      extras.signalStrength = field.value[0];
+    }
+
+    if (field.fieldId === 0x31 && field.length >= 1) {
+      extras.satelliteCount = field.value[0];
+    }
+
+    if (field.fieldId === TK905B_EB_FIELD_ID) {
+      if (field.length >= TK905B_EB_MIN_LENGTH_FOR_BATTERY) {
+        const batteryVoltageMv = field.value.readUInt16BE(TK905B_EB_BATTERY_VOLTAGE_OFFSET);
+        if (batteryVoltageMv >= BATTERY_VOLTAGE_MV_MIN && batteryVoltageMv <= BATTERY_VOLTAGE_MV_MAX) {
+          extras.batteryVoltageMv = batteryVoltageMv;
+          extras.batteryVoltage = batteryVoltageMv / 1000;
+        }
+      }
+
+      if (field.length >= TK905B_EB_MIN_LENGTH_FOR_BATTERY_PERCENT) {
+        const batteryPercent = field.value[TK905B_EB_BATTERY_PERCENT_OFFSET];
+        if (batteryPercent >= BATTERY_PERCENT_MIN && batteryPercent <= BATTERY_PERCENT_MAX) {
+          extras.batteryPercent = batteryPercent;
+        }
+      }
+    }
+  }
+
+  return extras;
 }
 
 function logPossibleTlv(
@@ -364,17 +417,18 @@ function log0200ExtrasDebug(terminalId: string, messageSequence: number, body: B
   console.log(`[jt808] extras debug terminalId=${terminalId} sequence=${messageSequence} fieldIds=${fieldIds}`);
 
   for (const field of fields) {
+    const fieldHex = field.value.toString("hex");
     console.log(
-      `[jt808] extras field terminalId=${terminalId} sequence=${messageSequence} fieldId=0x${field.fieldId.toString(16).padStart(2, "0")} length=${field.length} hex=${field.hex}`,
+      `[jt808] extras field terminalId=${terminalId} sequence=${messageSequence} fieldId=0x${field.fieldId.toString(16).padStart(2, "0")} length=${field.length} hex=${fieldHex}`,
     );
 
-    if (field.fieldId === 0xeb) {
-      log0xEbFieldDebug(terminalId, messageSequence, field.hex);
+    if (field.fieldId === TK905B_EB_FIELD_ID) {
+      log0xEbFieldDebug(terminalId, messageSequence, fieldHex);
     }
   }
 }
 
-function parseLocation0200(body: Buffer): ParsedLocation | null {
+function parseLocation0200(body: Buffer, terminalId: string): ParsedLocation | null {
   if (body.length < LOCATION_0200_BASE_BODY_LENGTH) {
     return null;
   }
@@ -385,8 +439,10 @@ function parseLocation0200(body: Buffer): ParsedLocation | null {
   const speedKph = body.readUInt16BE(18) / 10;
   const heading = body.readUInt16BE(20);
   const recordedAt = parseBcdDateTimeYYMMDDhhmmss(body.subarray(22, 28));
+  const { fields } = parse0200AdditionalInfo(body, terminalId);
+  const healthExtras = parse0200HealthExtras(fields);
 
-  return { lat, lng, speedKph, heading, altitude, recordedAt };
+  return { lat, lng, speedKph, heading, altitude, recordedAt, ...healthExtras };
 }
 
 function isValidLocation(location: ParsedLocation): boolean {
@@ -403,23 +459,41 @@ async function postLocationEvent(
   messageHex: string,
 ): Promise<void> {
   const url = `${opsflowApiUrl.replace(/\/+$/, "")}/internal/device-gateway/events`;
+  const locationPayload: Record<string, unknown> = {
+    lat: location.lat,
+    lng: location.lng,
+    speedKph: location.speedKph,
+    heading: location.heading,
+    altitude: location.altitude,
+    recordedAt: location.recordedAt,
+    rawMessageId: "0x0200",
+    rawPayload: {
+      hex,
+    },
+  };
+
+  if (location.batteryVoltageMv !== undefined) {
+    locationPayload.batteryVoltageMv = location.batteryVoltageMv;
+  }
+  if (location.batteryVoltage !== undefined) {
+    locationPayload.batteryVoltage = location.batteryVoltage;
+  }
+  if (location.batteryPercent !== undefined) {
+    locationPayload.batteryPercent = location.batteryPercent;
+  }
+  if (location.signalStrength !== undefined) {
+    locationPayload.signalStrength = location.signalStrength;
+  }
+  if (location.satelliteCount !== undefined) {
+    locationPayload.satelliteCount = location.satelliteCount;
+  }
+
   const payload = {
     protocol: "JT808",
     deviceType: "GPS_TRACKER",
     terminalId,
     event: "LOCATION",
-    payload: {
-      lat: location.lat,
-      lng: location.lng,
-      speedKph: location.speedKph,
-      heading: location.heading,
-      altitude: location.altitude,
-      recordedAt: location.recordedAt,
-      rawMessageId: "0x0200",
-      rawPayload: {
-        hex,
-      },
-    },
+    payload: locationPayload,
   };
   const retryDelaysMs = [0, 500, 1500];
 
@@ -440,8 +514,14 @@ async function postLocationEvent(
 
       if (response.ok) {
         totalSuccessfulBackendPosts += 1;
+        const batteryLog =
+          location.batteryVoltageMv !== undefined
+            ? ` batteryVoltageMv=${location.batteryVoltageMv}`
+            : "";
+        const percentLog =
+          location.batteryPercent !== undefined ? ` batteryPercent=${location.batteryPercent}` : "";
         console.log(
-          `[gateway] post success terminalId=${terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt} attempt=${attempt + 1}`,
+          `[gateway] post success terminalId=${terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt}${batteryLog}${percentLog} attempt=${attempt + 1}`,
         );
         return;
       }
@@ -536,7 +616,7 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
       log0200ExtrasDebug(header.terminalId, header.serialNo, body);
     }
 
-    const location = parseLocation0200(body);
+    const location = parseLocation0200(body, header.terminalId);
     if (location) {
       totalLocationPacketsParsed += 1;
       if (!isValidLocation(location)) {
