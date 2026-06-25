@@ -18,12 +18,13 @@ console.log(`[startup] DEVICE_GATEWAY_KEY loaded: ${Boolean(deviceGatewayKey)}`)
 console.log(`[startup] DEVICE_GATEWAY_KEY length: ${deviceGatewayKey.length}`);
 
 const START_FLAG = 0x7e;
-const msgSerialBySocket = new WeakMap<net.Socket, number>();
 const inboundCacheBySocket = new WeakMap<net.Socket, Buffer>();
+let serverSerial = 1;
 
 type Jt808Header = {
   messageId: number;
   bodyLength: number;
+  terminalIdRaw: Buffer;
   terminalId: string;
   serialNo: number;
 };
@@ -107,29 +108,32 @@ function parseHeader(packetNoFlag: Buffer): Jt808Header | null {
   const messageId = packetNoFlag.readUInt16BE(0);
   const bodyProps = packetNoFlag.readUInt16BE(2);
   const bodyLength = bodyProps & 0x03ff;
-  const terminalId = toBcdString(packetNoFlag.subarray(4, 10));
+  const terminalIdRaw = Buffer.from(packetNoFlag.subarray(4, 10));
+  const terminalId = toBcdString(terminalIdRaw);
   const serialNo = packetNoFlag.readUInt16BE(10);
 
-  return { messageId, bodyLength, terminalId, serialNo };
+  return { messageId, bodyLength, terminalIdRaw, terminalId, serialNo };
 }
 
-function nextSerial(socket: net.Socket): number {
-  const current = msgSerialBySocket.get(socket) ?? 0;
-  const next = (current + 1) & 0xffff;
-  msgSerialBySocket.set(socket, next);
+function nextSerial(): number {
+  const next = serverSerial & 0xffff;
+  serverSerial = (serverSerial + 1) & 0xffff;
+  if (serverSerial === 0) {
+    serverSerial = 1;
+  }
   return next;
 }
 
 function buildPacket(
   messageId: number,
-  terminalId: string,
+  terminalIdRaw: Buffer,
   serialNo: number,
   body: Buffer,
 ): Buffer {
   const header = Buffer.alloc(12);
   header.writeUInt16BE(messageId, 0);
-  header.writeUInt16BE(body.length & 0x03ff, 2);
-  fromBcdString(terminalId.padStart(12, "0").slice(-12)).copy(header, 4);
+  header.writeUInt16BE(body.length, 2);
+  terminalIdRaw.copy(header, 4);
   header.writeUInt16BE(serialNo, 10);
 
   const content = Buffer.concat([header, body]);
@@ -141,25 +145,23 @@ function buildPacket(
 function buildCommonAck(
   incomingHeader: Jt808Header,
   result: number,
-  socket: net.Socket,
 ): Buffer {
   const body = Buffer.alloc(5);
   body.writeUInt16BE(incomingHeader.serialNo, 0);
   body.writeUInt16BE(incomingHeader.messageId, 2);
   body.writeUInt8(result, 4);
 
-  return buildPacket(0x8001, incomingHeader.terminalId, nextSerial(socket), body);
+  return buildPacket(0x8001, incomingHeader.terminalIdRaw, nextSerial(), body);
 }
 
-function buildRegisterAck(incomingHeader: Jt808Header, socket: net.Socket): Buffer {
+function buildRegisterAck(incomingHeader: Jt808Header): Buffer {
   const auth = Buffer.from("opsflow", "ascii");
-  const body = Buffer.alloc(5 + auth.length);
+  const body = Buffer.alloc(3 + auth.length);
   body.writeUInt16BE(incomingHeader.serialNo, 0);
-  body.writeUInt16BE(0x0100, 2);
-  body.writeUInt8(0, 4);
-  auth.copy(body, 5);
+  body.writeUInt8(0, 2);
+  auth.copy(body, 3);
 
-  return buildPacket(0x8100, incomingHeader.terminalId, nextSerial(socket), body);
+  return buildPacket(0x8100, incomingHeader.terminalIdRaw, nextSerial(), body);
 }
 
 function parseBcdDateTimeYYMMDDhhmmss(data: Buffer): string {
@@ -287,8 +289,10 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
   console.log(`[jt808] recv messageId=${messageHex} terminalId=${header.terminalId} serialNo=${header.serialNo}`);
 
   if (header.messageId === 0x0100) {
-    socket.write(buildRegisterAck(header, socket));
+    const ack8100 = buildRegisterAck(header);
+    socket.write(ack8100);
     console.log(`[jt808] sent messageId=0x8100 terminalId=${header.terminalId}`);
+    console.log(`[jt808] ack hex messageId=0x8100 terminalId=${header.terminalId} hex=${ack8100.toString("hex")}`);
     return;
   }
 
@@ -309,8 +313,10 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
     }
   }
 
-  socket.write(buildCommonAck(header, 0, socket));
+  const ack8001 = buildCommonAck(header, 0);
+  socket.write(ack8001);
   console.log(`[jt808] sent messageId=0x8001 terminalId=${header.terminalId} for=${messageHex}`);
+  console.log(`[jt808] ack hex messageId=0x8001 terminalId=${header.terminalId} for=${messageHex} hex=${ack8001.toString("hex")}`);
 }
 
 const server = net.createServer((socket) => {
@@ -331,7 +337,6 @@ const server = net.createServer((socket) => {
 
   socket.on("close", () => {
     inboundCacheBySocket.delete(socket);
-    msgSerialBySocket.delete(socket);
     console.log(`[tcp] client disconnected ${addr}`);
   });
 
