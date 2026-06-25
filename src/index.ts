@@ -19,7 +19,13 @@ console.log(`[startup] DEVICE_GATEWAY_KEY length: ${deviceGatewayKey.length}`);
 
 const START_FLAG = 0x7e;
 const inboundCacheBySocket = new WeakMap<net.Socket, Buffer>();
+const activeSockets = new Set<net.Socket>();
 let serverSerial = 1;
+let totalPacketsReceived = 0;
+let totalLocationPacketsParsed = 0;
+let totalSuccessfulBackendPosts = 0;
+let totalFailedBackendPosts = 0;
+let isShuttingDown = false;
 
 type Jt808Header = {
   messageId: number;
@@ -37,6 +43,10 @@ type ParsedLocation = {
   altitude: number;
   recordedAt: string;
 };
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function toBcdString(data: Buffer): string {
   let out = "";
@@ -195,13 +205,20 @@ function parseLocation0200(body: Buffer): ParsedLocation | null {
   return { lat, lng, speedKph, heading, altitude, recordedAt };
 }
 
-async function postLocationEvent(terminalId: string, location: ParsedLocation, hex: string): Promise<void> {
-  const url = `${opsflowApiUrl.replace(/\/+$/, "")}/internal/device-gateway/events`;
-  const hasGatewayKeyHeader = deviceGatewayKey.length > 0;
-  console.log(`[gateway] pre-post url=${url}`);
-  console.log(`[gateway] pre-post x-device-gateway-key present=${hasGatewayKeyHeader}`);
-  console.log(`[gateway] pre-post x-device-gateway-key length=${deviceGatewayKey.length}`);
+function isValidLocation(location: ParsedLocation): boolean {
+  const validLat = location.lat >= -90 && location.lat <= 90;
+  const validLng = location.lng >= -180 && location.lng <= 180;
+  const validRecordedAt = !Number.isNaN(Date.parse(location.recordedAt));
+  return validLat && validLng && validRecordedAt;
+}
 
+async function postLocationEvent(
+  terminalId: string,
+  location: ParsedLocation,
+  hex: string,
+  messageHex: string,
+): Promise<void> {
+  const url = `${opsflowApiUrl.replace(/\/+$/, "")}/internal/device-gateway/events`;
   const payload = {
     protocol: "JT808",
     deviceType: "GPS_TRACKER",
@@ -220,19 +237,52 @@ async function postLocationEvent(terminalId: string, location: ParsedLocation, h
       },
     },
   };
+  const retryDelaysMs = [0, 500, 1500];
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-device-gateway-key": deviceGatewayKey,
-    },
-    body: JSON.stringify(payload),
-  });
+  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+    if (retryDelaysMs[attempt] > 0) {
+      await delay(retryDelaysMs[attempt]);
+    }
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`POST ${response.status} ${response.statusText} - ${body}`);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-device-gateway-key": deviceGatewayKey,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        totalSuccessfulBackendPosts += 1;
+        console.log(
+          `[gateway] post success terminalId=${terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt} attempt=${attempt + 1}`,
+        );
+        return;
+      }
+
+      const body = await response.text();
+      const httpError = `POST ${response.status} ${response.statusText} - ${body}`;
+      if (response.status >= 500 && attempt < retryDelaysMs.length - 1) {
+        console.warn(
+          `[gateway] post retry terminalId=${terminalId} messageId=${messageHex} attempt=${attempt + 1} reason=${httpError}`,
+        );
+        continue;
+      }
+
+      totalFailedBackendPosts += 1;
+      throw new Error(httpError);
+    } catch (error: unknown) {
+      if (attempt < retryDelaysMs.length - 1) {
+        console.warn(
+          `[gateway] post retry terminalId=${terminalId} messageId=${messageHex} attempt=${attempt + 1} error=${String(error)}`,
+        );
+        continue;
+      }
+      totalFailedBackendPosts += 1;
+      throw error;
+    }
   }
 }
 
@@ -265,6 +315,7 @@ function extractFrames(buffer: Buffer): { frames: Buffer[]; rest: Buffer } {
 }
 
 function processFrame(socket: net.Socket, rawFrame: Buffer): void {
+  totalPacketsReceived += 1;
   const decoded = unescapeJt808(rawFrame);
   if (decoded.length < 13) {
     return;
@@ -299,15 +350,22 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
   if (header.messageId === 0x0200) {
     const location = parseLocation0200(body);
     if (location) {
-      postLocationEvent(header.terminalId, location, packetNoChecksum.toString("hex"))
+      totalLocationPacketsParsed += 1;
+      if (!isValidLocation(location)) {
+        console.warn(
+          `[jt808] invalid location terminalId=${header.terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt}`,
+        );
+      } else {
+        postLocationEvent(header.terminalId, location, packetNoChecksum.toString("hex"), messageHex)
         .then(() => {
-          console.log(`[gateway] post success messageId=${messageHex} terminalId=${header.terminalId}`);
+          // success log is emitted inside postLocationEvent with detailed payload context.
         })
         .catch((error: unknown) => {
           console.error(
-            `[gateway] post failure messageId=${messageHex} terminalId=${header.terminalId} error=${String(error)}`,
+            `[gateway] post failure terminalId=${header.terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt} error=${String(error)}`,
           );
         });
+      }
     } else {
       console.warn(`[jt808] invalid 0x0200 body terminalId=${header.terminalId}`);
     }
@@ -322,6 +380,7 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
 const server = net.createServer((socket) => {
   const addr = `${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? "unknown"}`;
   console.log(`[tcp] client connected ${addr}`);
+  activeSockets.add(socket);
   inboundCacheBySocket.set(socket, Buffer.alloc(0));
 
   socket.on("data", (chunk) => {
@@ -337,6 +396,7 @@ const server = net.createServer((socket) => {
 
   socket.on("close", () => {
     inboundCacheBySocket.delete(socket);
+    activeSockets.delete(socket);
     console.log(`[tcp] client disconnected ${addr}`);
   });
 
@@ -352,3 +412,40 @@ server.on("error", (err) => {
 server.listen(tcpPort, () => {
   console.log(`[startup] opsflow-device-gateway listening on TCP ${tcpPort}`);
 });
+
+const healthInterval = setInterval(() => {
+  console.log(
+    `[health] sockets=${activeSockets.size} packets=${totalPacketsReceived} locations=${totalLocationPacketsParsed} posts_ok=${totalSuccessfulBackendPosts} posts_failed=${totalFailedBackendPosts}`,
+  );
+}, 60_000);
+
+function shutdown(signal: string): void {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
+  console.log(`[shutdown] signal=${signal} stopping gateway`);
+  clearInterval(healthInterval);
+
+  server.close((err?: Error) => {
+    if (err) {
+      console.error(`[shutdown] server close error=${err.message}`);
+      process.exit(1);
+      return;
+    }
+    console.log("[shutdown] tcp server closed");
+    process.exit(0);
+  });
+
+  for (const socket of activeSockets) {
+    socket.end();
+    setTimeout(() => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    }, 2000);
+  }
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
