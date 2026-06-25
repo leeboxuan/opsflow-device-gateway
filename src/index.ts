@@ -230,6 +230,124 @@ function parse0200AdditionalInfo(
   return { rawHex: extras.toString("hex"), fields };
 }
 
+function logPossibleTlv(
+  data: Buffer,
+  terminalId: string,
+  messageSequence: number,
+  scheme: string,
+  idLen: number,
+  lenLen: number,
+): void {
+  const fields: string[] = [];
+  let offset = 0;
+  const headerLen = idLen + lenLen;
+
+  while (offset + headerLen <= data.length) {
+    let fieldId: number;
+    let fieldLen: number;
+
+    if (idLen === 1 && lenLen === 1) {
+      fieldId = data[offset];
+      fieldLen = data[offset + 1];
+    } else if (idLen === 2 && lenLen === 2) {
+      fieldId = data.readUInt16BE(offset);
+      fieldLen = data.readUInt16BE(offset + 2);
+    } else if (idLen === 2 && lenLen === 1) {
+      fieldId = data.readUInt16BE(offset);
+      fieldLen = data[offset + 2];
+    } else {
+      return;
+    }
+
+    if (fieldLen < 0 || offset + headerLen + fieldLen > data.length) {
+      fields.push(`truncated@offset=${offset}`);
+      break;
+    }
+
+    const value = data.subarray(offset + headerLen, offset + headerLen + fieldLen);
+    const idHex =
+      idLen === 1
+        ? `0x${fieldId.toString(16).padStart(2, "0")}`
+        : `0x${fieldId.toString(16).padStart(4, "0")}`;
+    fields.push(`${idHex} len=${fieldLen} hex=${value.toString("hex")}`);
+    offset += headerLen + fieldLen;
+  }
+
+  if (offset < data.length && fields.length > 0) {
+    fields.push(`remaining=${data.subarray(offset).toString("hex")}`);
+  }
+
+  const summary = fields.length > 0 ? fields.join("; ") : "no complete TLV fields parsed";
+  console.log(
+    `[jt808] extras 0xeb tlv terminalId=${terminalId} sequence=${messageSequence} scheme=${scheme} ${summary}`,
+  );
+}
+
+function log0xEbFieldDebug(terminalId: string, messageSequence: number, fieldHex: string): void {
+  const data = Buffer.from(fieldHex, "hex");
+
+  console.log(
+    `[jt808] extras 0xeb debug terminalId=${terminalId} sequence=${messageSequence} length=${data.length} rawHex=${fieldHex}`,
+  );
+
+  console.log(`[jt808] extras 0xeb bytes terminalId=${terminalId} sequence=${messageSequence} count=${data.length}`);
+  for (let i = 0; i < data.length; i += 1) {
+    const u8 = data[i];
+    const i8 = u8 > 127 ? u8 - 256 : u8;
+    console.log(
+      `[jt808] extras 0xeb byte terminalId=${terminalId} sequence=${messageSequence} offset=${i} hex=${u8.toString(16).padStart(2, "0")} uint8=${u8} int8=${i8}`,
+    );
+  }
+
+  if (data.length >= 2) {
+    for (let i = 0; i <= data.length - 2; i += 1) {
+      const u16 = data.readUInt16BE(i);
+      const i16 = data.readInt16BE(i);
+      console.log(
+        `[jt808] extras 0xeb u16 window terminalId=${terminalId} sequence=${messageSequence} offset=${i} uint16BE=${u16} int16BE=${i16}`,
+      );
+    }
+  }
+
+  if (data.length >= 4) {
+    for (let i = 0; i <= data.length - 4; i += 1) {
+      const u32 = data.readUInt32BE(i);
+      const i32 = data.readInt32BE(i);
+      console.log(
+        `[jt808] extras 0xeb u32 window terminalId=${terminalId} sequence=${messageSequence} offset=${i} uint32BE=${u32} int32BE=${i32}`,
+      );
+    }
+  }
+
+  logPossibleTlv(data, terminalId, messageSequence, "id1-len1", 1, 1);
+  logPossibleTlv(data, terminalId, messageSequence, "id2-len2", 2, 2);
+  logPossibleTlv(data, terminalId, messageSequence, "id2-len1", 2, 1);
+
+  const percentCandidates: string[] = [];
+  const voltageCandidates: string[] = [];
+
+  for (let i = 0; i < data.length; i += 1) {
+    const u8 = data[i];
+    if (u8 >= 0 && u8 <= 100) {
+      percentCandidates.push(`offset=${i} uint8=${u8}`);
+    }
+  }
+
+  for (let i = 0; i <= data.length - 2; i += 1) {
+    const u16 = data.readUInt16BE(i);
+    if (u16 >= 3700 && u16 <= 4300) {
+      voltageCandidates.push(`offset=${i} uint16BE=${u16}mV`);
+    }
+    if (u16 >= 37 && u16 <= 43) {
+      voltageCandidates.push(`offset=${i} uint16BE=${u16}(tenths/decivolts)`);
+    }
+  }
+
+  console.log(
+    `[jt808] extras 0xeb battery candidates terminalId=${terminalId} sequence=${messageSequence} percent=[${percentCandidates.join(", ") || "none"}] voltage=[${voltageCandidates.join(", ") || "none"}]`,
+  );
+}
+
 function log0200ExtrasDebug(terminalId: string, messageSequence: number, body: Buffer): void {
   const { rawHex, fields } = parse0200AdditionalInfo(body, terminalId);
 
@@ -249,6 +367,10 @@ function log0200ExtrasDebug(terminalId: string, messageSequence: number, body: B
     console.log(
       `[jt808] extras field terminalId=${terminalId} sequence=${messageSequence} fieldId=0x${field.fieldId.toString(16).padStart(2, "0")} length=${field.length} hex=${field.hex}`,
     );
+
+    if (field.fieldId === 0xeb) {
+      log0xEbFieldDebug(terminalId, messageSequence, field.hex);
+    }
   }
 }
 
