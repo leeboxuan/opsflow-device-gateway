@@ -13,6 +13,10 @@ if (!deviceGatewayKey) {
   console.warn("[startup] DEVICE_GATEWAY_KEY is empty; backend auth header will be blank.");
 }
 
+console.log(`[startup] OPSFLOW_API_URL loaded: ${Boolean(opsflowApiUrl)}`);
+console.log(`[startup] DEVICE_GATEWAY_KEY loaded: ${Boolean(deviceGatewayKey)}`);
+console.log(`[startup] DEVICE_GATEWAY_KEY length: ${deviceGatewayKey.length}`);
+
 const START_FLAG = 0x7e;
 const msgSerialBySocket = new WeakMap<net.Socket, number>();
 const inboundCacheBySocket = new WeakMap<net.Socket, Buffer>();
@@ -191,6 +195,11 @@ function parseLocation0200(body: Buffer): ParsedLocation | null {
 
 async function postLocationEvent(terminalId: string, location: ParsedLocation, hex: string): Promise<void> {
   const url = `${opsflowApiUrl.replace(/\/+$/, "")}/internal/device-gateway/events`;
+  const hasGatewayKeyHeader = deviceGatewayKey.length > 0;
+  console.log(`[gateway] pre-post url=${url}`);
+  console.log(`[gateway] pre-post x-device-gateway-key present=${hasGatewayKeyHeader}`);
+  console.log(`[gateway] pre-post x-device-gateway-key length=${deviceGatewayKey.length}`);
+
   const payload = {
     protocol: "JT808",
     deviceType: "GPS_TRACKER",
