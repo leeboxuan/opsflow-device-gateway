@@ -4,6 +4,7 @@ import net from "node:net";
 const tcpPort = Number(process.env.TCP_PORT ?? "8088");
 const opsflowApiUrl = process.env.OPSFLOW_API_URL?.trim() ?? "";
 const deviceGatewayKey = process.env.DEVICE_GATEWAY_KEY?.trim() ?? "";
+const debugJt808Extras = process.env.DEBUG_JT808_EXTRAS === "true";
 
 if (!opsflowApiUrl) {
   console.warn("[startup] OPSFLOW_API_URL is empty; LOCATION POST will fail until configured.");
@@ -16,6 +17,7 @@ if (!deviceGatewayKey) {
 console.log(`[startup] OPSFLOW_API_URL loaded: ${Boolean(opsflowApiUrl)}`);
 console.log(`[startup] DEVICE_GATEWAY_KEY loaded: ${Boolean(deviceGatewayKey)}`);
 console.log(`[startup] DEVICE_GATEWAY_KEY length: ${deviceGatewayKey.length}`);
+console.log(`[startup] DEBUG_JT808_EXTRAS: ${debugJt808Extras}`);
 
 const START_FLAG = 0x7e;
 const inboundCacheBySocket = new WeakMap<net.Socket, Buffer>();
@@ -43,6 +45,14 @@ type ParsedLocation = {
   altitude: number;
   recordedAt: string;
 };
+
+type AdditionalInfoField = {
+  fieldId: number;
+  length: number;
+  hex: string;
+};
+
+const LOCATION_0200_BASE_BODY_LENGTH = 28;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -190,8 +200,60 @@ function parseBcdDateTimeYYMMDDhhmmss(data: Buffer): string {
   return new Date(Date.UTC(year, Math.max(0, month - 1), day, hour, minute, second)).toISOString();
 }
 
+function parse0200AdditionalInfo(
+  body: Buffer,
+  terminalId: string,
+): { rawHex: string; fields: AdditionalInfoField[] } {
+  const extras = body.subarray(LOCATION_0200_BASE_BODY_LENGTH);
+  const fields: AdditionalInfoField[] = [];
+  let offset = 0;
+
+  while (offset + 2 <= extras.length) {
+    const fieldId = extras[offset];
+    const length = extras[offset + 1];
+    if (offset + 2 + length > extras.length) {
+      console.warn(
+        `[jt808] extras parse truncated terminalId=${terminalId} fieldId=0x${fieldId.toString(16).padStart(2, "0")} offset=${offset}`,
+      );
+      break;
+    }
+
+    const value = extras.subarray(offset + 2, offset + 2 + length);
+    fields.push({
+      fieldId,
+      length,
+      hex: value.toString("hex"),
+    });
+    offset += 2 + length;
+  }
+
+  return { rawHex: extras.toString("hex"), fields };
+}
+
+function log0200ExtrasDebug(terminalId: string, messageSequence: number, body: Buffer): void {
+  const { rawHex, fields } = parse0200AdditionalInfo(body, terminalId);
+
+  console.log(
+    `[jt808] extras debug terminalId=${terminalId} sequence=${messageSequence} rawAdditionalInfoHex=${rawHex || "(empty)"}`,
+  );
+
+  if (fields.length === 0) {
+    console.log(`[jt808] extras debug terminalId=${terminalId} sequence=${messageSequence} fieldIds=(none)`);
+    return;
+  }
+
+  const fieldIds = fields.map((field) => `0x${field.fieldId.toString(16).padStart(2, "0")}`).join(",");
+  console.log(`[jt808] extras debug terminalId=${terminalId} sequence=${messageSequence} fieldIds=${fieldIds}`);
+
+  for (const field of fields) {
+    console.log(
+      `[jt808] extras field terminalId=${terminalId} sequence=${messageSequence} fieldId=0x${field.fieldId.toString(16).padStart(2, "0")} length=${field.length} hex=${field.hex}`,
+    );
+  }
+}
+
 function parseLocation0200(body: Buffer): ParsedLocation | null {
-  if (body.length < 28) {
+  if (body.length < LOCATION_0200_BASE_BODY_LENGTH) {
     return null;
   }
 
@@ -348,6 +410,10 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
   }
 
   if (header.messageId === 0x0200) {
+    if (debugJt808Extras) {
+      log0200ExtrasDebug(header.terminalId, header.serialNo, body);
+    }
+
     const location = parseLocation0200(body);
     if (location) {
       totalLocationPacketsParsed += 1;
