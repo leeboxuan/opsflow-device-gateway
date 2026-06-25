@@ -59,14 +59,18 @@ type AdditionalInfoField = {
 
 const LOCATION_0200_BASE_BODY_LENGTH = 28;
 const TK905B_EB_FIELD_ID = 0xeb;
-const TK905B_EB_BATTERY_VOLTAGE_OFFSET = 34;
-const TK905B_EB_BATTERY_PERCENT_OFFSET = 40;
-const TK905B_EB_MIN_LENGTH_FOR_BATTERY = 36;
-const TK905B_EB_MIN_LENGTH_FOR_BATTERY_PERCENT = 41;
+const TK905B_EB_VOLTAGE_CHUNK_LENGTH = 4;
+const TK905B_EB_PERCENT_CHUNK_LENGTH = 3;
+const TK905B_EB_VOLTAGE_VALUE_OFFSET = 2;
 const BATTERY_VOLTAGE_MV_MIN = 3000;
 const BATTERY_VOLTAGE_MV_MAX = 4500;
 const BATTERY_PERCENT_MIN = 0;
 const BATTERY_PERCENT_MAX = 100;
+
+type EbChunk = {
+  chunkLength: number;
+  payload: Buffer;
+};
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -244,6 +248,83 @@ function parse0200AdditionalInfo(
   return { rawHex: extras.toString("hex"), fields };
 }
 
+function parse0xEbChunks(data: Buffer): EbChunk[] {
+  const chunks: EbChunk[] = [];
+  let offset = 0;
+
+  while (offset + 2 <= data.length) {
+    const chunkLength = data.readUInt16BE(offset);
+    if (offset + 2 + chunkLength > data.length) {
+      break;
+    }
+
+    const payload = data.subarray(offset + 2, offset + 2 + chunkLength);
+    chunks.push({ chunkLength, payload });
+    offset += 2 + chunkLength;
+  }
+
+  return chunks;
+}
+
+function parse0xEbBatteryExtras(
+  data: Buffer,
+): Pick<ParsedLocation, "batteryVoltageMv" | "batteryVoltage" | "batteryPercent"> {
+  const extras: Pick<ParsedLocation, "batteryVoltageMv" | "batteryVoltage" | "batteryPercent"> = {};
+
+  for (const chunk of parse0xEbChunks(data)) {
+    if (chunk.chunkLength === TK905B_EB_VOLTAGE_CHUNK_LENGTH && chunk.payload.length === TK905B_EB_VOLTAGE_CHUNK_LENGTH) {
+      const batteryVoltageMv = chunk.payload.readUInt16BE(TK905B_EB_VOLTAGE_VALUE_OFFSET);
+      if (batteryVoltageMv >= BATTERY_VOLTAGE_MV_MIN && batteryVoltageMv <= BATTERY_VOLTAGE_MV_MAX) {
+        extras.batteryVoltageMv = batteryVoltageMv;
+        extras.batteryVoltage = batteryVoltageMv / 1000;
+      }
+    }
+
+    if (chunk.chunkLength === TK905B_EB_PERCENT_CHUNK_LENGTH && chunk.payload.length === TK905B_EB_PERCENT_CHUNK_LENGTH) {
+      const batteryPercent = chunk.payload[2];
+      if (batteryPercent >= BATTERY_PERCENT_MIN && batteryPercent <= BATTERY_PERCENT_MAX) {
+        extras.batteryPercent = batteryPercent;
+      }
+    }
+  }
+
+  return extras;
+}
+
+function logParsedHealth(
+  terminalId: string,
+  health: Pick<
+    ParsedLocation,
+    "batteryVoltageMv" | "batteryVoltage" | "batteryPercent" | "signalStrength" | "satelliteCount"
+  >,
+): void {
+  const hasHealth =
+    health.batteryPercent !== undefined ||
+    health.batteryVoltageMv !== undefined ||
+    health.signalStrength !== undefined ||
+    health.satelliteCount !== undefined;
+
+  if (!hasHealth) {
+    return;
+  }
+
+  const parts = [`terminalId=${terminalId}`];
+  if (health.batteryPercent !== undefined) {
+    parts.push(`batteryPercent=${health.batteryPercent}`);
+  }
+  if (health.batteryVoltageMv !== undefined) {
+    parts.push(`batteryVoltageMv=${health.batteryVoltageMv}`);
+  }
+  if (health.signalStrength !== undefined) {
+    parts.push(`signalStrength=${health.signalStrength}`);
+  }
+  if (health.satelliteCount !== undefined) {
+    parts.push(`satelliteCount=${health.satelliteCount}`);
+  }
+
+  console.log(`[jt808] health ${parts.join(" ")}`);
+}
+
 function parse0200HealthExtras(fields: AdditionalInfoField[]): Pick<
   ParsedLocation,
   "batteryVoltageMv" | "batteryVoltage" | "batteryPercent" | "signalStrength" | "satelliteCount"
@@ -263,20 +344,7 @@ function parse0200HealthExtras(fields: AdditionalInfoField[]): Pick<
     }
 
     if (field.fieldId === TK905B_EB_FIELD_ID) {
-      if (field.length >= TK905B_EB_MIN_LENGTH_FOR_BATTERY) {
-        const batteryVoltageMv = field.value.readUInt16BE(TK905B_EB_BATTERY_VOLTAGE_OFFSET);
-        if (batteryVoltageMv >= BATTERY_VOLTAGE_MV_MIN && batteryVoltageMv <= BATTERY_VOLTAGE_MV_MAX) {
-          extras.batteryVoltageMv = batteryVoltageMv;
-          extras.batteryVoltage = batteryVoltageMv / 1000;
-        }
-      }
-
-      if (field.length >= TK905B_EB_MIN_LENGTH_FOR_BATTERY_PERCENT) {
-        const batteryPercent = field.value[TK905B_EB_BATTERY_PERCENT_OFFSET];
-        if (batteryPercent >= BATTERY_PERCENT_MIN && batteryPercent <= BATTERY_PERCENT_MAX) {
-          extras.batteryPercent = batteryPercent;
-        }
-      }
+      Object.assign(extras, parse0xEbBatteryExtras(field.value));
     }
   }
 
@@ -341,6 +409,23 @@ function log0xEbFieldDebug(terminalId: string, messageSequence: number, fieldHex
 
   console.log(
     `[jt808] extras 0xeb debug terminalId=${terminalId} sequence=${messageSequence} length=${data.length} rawHex=${fieldHex}`,
+  );
+
+  const chunks = parse0xEbChunks(data);
+  if (chunks.length === 0) {
+    console.log(`[jt808] extras 0xeb chunks terminalId=${terminalId} sequence=${messageSequence} (none parsed)`);
+  } else {
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      console.log(
+        `[jt808] extras 0xeb chunk terminalId=${terminalId} sequence=${messageSequence} index=${i} chunkLength=${chunk.chunkLength} payloadHex=${chunk.payload.toString("hex")}`,
+      );
+    }
+  }
+
+  const battery = parse0xEbBatteryExtras(data);
+  console.log(
+    `[jt808] extras 0xeb parsed terminalId=${terminalId} sequence=${messageSequence} batteryVoltageMv=${battery.batteryVoltageMv ?? "n/a"} batteryPercent=${battery.batteryPercent ?? "n/a"}`,
   );
 
   console.log(`[jt808] extras 0xeb bytes terminalId=${terminalId} sequence=${messageSequence} count=${data.length}`);
@@ -619,6 +704,7 @@ function processFrame(socket: net.Socket, rawFrame: Buffer): void {
     const location = parseLocation0200(body, header.terminalId);
     if (location) {
       totalLocationPacketsParsed += 1;
+      logParsedHealth(header.terminalId, location);
       if (!isValidLocation(location)) {
         console.warn(
           `[jt808] invalid location terminalId=${header.terminalId} messageId=${messageHex} lat=${location.lat} lng=${location.lng} recordedAt=${location.recordedAt}`,
